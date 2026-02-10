@@ -235,7 +235,7 @@ class SWEBenchEvaluation(Evaluation):
         )
 
         # --- Memory system integration ---
-        use_memory = getattr(self.metadata, 'use_memory', False)
+        use_memory = getattr(self, '_use_memory', False)
         memory_manager = None
 
         if use_memory:
@@ -433,14 +433,14 @@ def main() -> None:
         max_retries=args.max_retries,
         workspace_type=args.workspace,
     )
-    # Attach use_memory flag as an attribute (not part of EvalMetadata schema)
-    metadata.use_memory = args.use_memory  # type: ignore[attr-defined]
 
     # Run orchestrator with a simple JSONL writer
     evaluator = SWEBenchEvaluation(
         metadata=metadata,
         num_workers=args.num_workers,
     )
+    # Attach use_memory flag to evaluator (EvalMetadata is a strict Pydantic model)
+    evaluator._use_memory = args.use_memory  # type: ignore[attr-defined]
 
     evaluator.run(on_result=get_default_on_result_writer(evaluator.output_path))
 
