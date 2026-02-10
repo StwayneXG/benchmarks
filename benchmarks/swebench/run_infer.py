@@ -34,6 +34,7 @@ from benchmarks.utils.models import (
 from benchmarks.utils.version import SDK_SHORT_SHA
 from openhands.sdk import LLM, Agent, Conversation, get_logger
 from openhands.sdk.workspace import RemoteWorkspace
+from openhands.sdk.tool import Tool, register_tool
 from openhands.tools.preset.default import get_default_tools
 from openhands.workspace import APIRemoteWorkspace, DockerWorkspace
 
@@ -232,6 +233,48 @@ class SWEBenchEvaluation(Evaluation):
             # Disable browser tools in CLI mode
             enable_browser=False,
         )
+
+        # --- Memory system integration ---
+        use_memory = getattr(self.metadata, 'use_memory', False)
+        memory_manager = None
+
+        if use_memory:
+            from benchmarks.swebench.memory_config import MemoryConfig
+            from benchmarks.swebench.experience_hooks import MemoryManager
+            from benchmarks.swebench.label_action_tool import LabelActionTool
+            from benchmarks.swebench.recall_experience_tool import RecallExperienceTool
+
+            # Initialize memory manager for this instance
+            memory_config = MemoryConfig()
+            memory_manager = MemoryManager(
+                config=memory_config,
+                llm=self.metadata.llm,
+                instance_id=instance.id,
+                repo=instance.data.get('repo', ''),
+                issue_description=instance.data.get('problem_statement', ''),
+            )
+
+            # Register tools with callbacks wired to this MemoryManager
+            register_tool(
+                LabelActionTool.name,
+                lambda params, conv_state: LabelActionTool.create(
+                    conv_state=conv_state,
+                    on_label_callback=memory_manager.on_action_labeled,
+                ),
+            )
+            register_tool(
+                RecallExperienceTool.name,
+                lambda params, conv_state: RecallExperienceTool.create(
+                    conv_state=conv_state,
+                    on_recall_callback=memory_manager.on_recall_experience,
+                ),
+            )
+
+            tools.append(Tool(name=LabelActionTool.name))
+            tools.append(Tool(name=RecallExperienceTool.name))
+            logger.info("Memory system enabled with tools: %s, %s",
+                        LabelActionTool.name, RecallExperienceTool.name)
+
         agent = Agent(
             llm=self.metadata.llm,
             tools=tools,
@@ -337,6 +380,12 @@ def main() -> None:
         choices=choices,
         help="Path to prompt template file",
     )
+    parser.add_argument(
+        "--use-memory",
+        action="store_true",
+        default=False,
+        help="Enable experience-based memory system (recall + label tools)",
+    )
     parser.set_defaults(**INFER_DEFAULTS)
     args = parser.parse_args()
 
@@ -384,6 +433,8 @@ def main() -> None:
         max_retries=args.max_retries,
         workspace_type=args.workspace,
     )
+    # Attach use_memory flag as an attribute (not part of EvalMetadata schema)
+    metadata.use_memory = args.use_memory  # type: ignore[attr-defined]
 
     # Run orchestrator with a simple JSONL writer
     evaluator = SWEBenchEvaluation(
