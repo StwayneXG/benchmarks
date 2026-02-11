@@ -353,6 +353,22 @@ class SWEBenchEvaluation(Evaluation):
         )
         git_patch = git_patch_result.stdout
 
+        # --- Save experiences from conversation history ---
+        if use_memory and memory_manager:
+            try:
+                events = list(conversation.state.events)
+                save_result = memory_manager.save_experiences_from_history(
+                    events=events,
+                    git_patch=git_patch,
+                )
+                logger.info(
+                    "Memory: saved %d test + %d patch experiences",
+                    save_result["test_experiences"],
+                    save_result["patch_experiences"],
+                )
+            except Exception as e:
+                logger.warning("Memory: failed to save experiences: %s", e)
+
         # EvalOutput is your model; keep fields consistent with prior JSONL
         out = EvalOutput(
             instance_id=instance.id,

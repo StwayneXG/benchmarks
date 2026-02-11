@@ -309,3 +309,128 @@ class MemoryManager:
         self.store.save_patch_experience(exp)
         
         return {"feedback": feedback}
+
+    # =========================================================================
+    # Post-Conversation Experience Saving
+    # =========================================================================
+
+    def save_experiences_from_history(
+        self,
+        events: list,
+        git_patch: str = "",
+    ) -> dict:
+        """
+        Analyze conversation history and save experiences after the conversation.
+
+        This is the primary saving mechanism when using Docker workspace,
+        since custom tools can't run server-side. It scans the event list for
+        terminal commands (potential test actions) and file edits (potential
+        patch actions), then saves them as experiences.
+
+        Args:
+            events: List of conversation events (from conversation.state.events)
+            git_patch: The final git patch produced by the agent
+
+        Returns:
+            Dict with counts: {"test_experiences": N, "patch_experiences": N}
+        """
+        from openhands.sdk.event.llm_convertible.action import ActionEvent
+        from openhands.sdk.event.llm_convertible.observation import ObservationEvent
+        from openhands.sdk.llm import content_to_str
+
+        test_count = 0
+        patch_count = 0
+
+        # Pair up ActionEvents with their corresponding ObservationEvents
+        action_observation_pairs: list[tuple[ActionEvent, ObservationEvent | None]] = []
+        action_map: dict[str, ActionEvent] = {}  # map event id -> ActionEvent
+
+        for event in events:
+            if isinstance(event, ActionEvent):
+                action_map[event.id] = event
+            elif isinstance(event, ObservationEvent):
+                action_id = event.action_id
+                if action_id in action_map:
+                    action_observation_pairs.append(
+                        (action_map[action_id], event)
+                    )
+
+        # Process terminal commands as test experiences
+        for action_event, obs_event in action_observation_pairs:
+            if action_event.tool_name != "terminal":
+                continue
+
+            # Extract command from action
+            command = ""
+            if action_event.action:
+                action_dict = action_event.action.model_dump()
+                command = action_dict.get("command", "")
+
+            # Skip non-test commands
+            if not self._looks_like_test_command(command):
+                continue
+
+            # Extract output from observation
+            exec_result = ""
+            if obs_event and obs_event.observation:
+                exec_result = "\n".join(
+                    content_to_str(obs_event.observation.to_llm_content)
+                )
+
+            # Extract thought/description
+            thought = " ".join(t.text for t in action_event.thought)
+            description = action_event.summary or thought[:200]
+
+            # Truncate long outputs
+            exec_result = exec_result[:5000]
+
+            exp = TestExperience(
+                instance_id=self.instance_id,
+                repo=self.repo,
+                issue_description=self.issue_description,
+                new_test=command,
+                exec_result=exec_result,
+                reproduces=False,  # We can't determine this without reviewer
+                description=description,
+            )
+            self.store.save_test_experience(exp)
+            test_count += 1
+
+        # Save the final git patch as a patch experience
+        if git_patch and git_patch.strip():
+            # Collect the agent's final thoughts about the patch
+            patch_descriptions = []
+            for action_event, _ in action_observation_pairs:
+                if action_event.tool_name == "file_editor":
+                    summary = action_event.summary or ""
+                    if summary:
+                        patch_descriptions.append(summary)
+
+            description = "; ".join(patch_descriptions[-3:]) if patch_descriptions else "Agent patch"
+
+            exp = PatchExperience(
+                instance_id=self.instance_id,
+                repo=self.repo,
+                issue_description=self.issue_description,
+                new_patch=git_patch[:10000],  # Truncate very large patches
+                fixes_issue=False,  # Unknown until eval
+                description=description,
+            )
+            self.store.save_patch_experience(exp)
+            patch_count += 1
+
+        return {"test_experiences": test_count, "patch_experiences": patch_count}
+
+    @staticmethod
+    def _looks_like_test_command(command: str) -> bool:
+        """Heuristic: does this command look like a test invocation?"""
+        if not command:
+            return False
+        test_indicators = [
+            "pytest", "python -m pytest", "python -m unittest",
+            "test_", "_test.py", "tests/", "tox", "nosetests",
+            "python -m test", "make test", "npm test",
+        ]
+        command_lower = command.lower()
+        return any(indicator in command_lower for indicator in test_indicators)
+
