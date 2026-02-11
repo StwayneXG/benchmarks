@@ -355,6 +355,25 @@ class MemoryManager:
                         (action_map[action_id], event)
                     )
 
+        # Categorize file_editor actions into test vs source edits
+        test_file_summaries = []
+        source_file_summaries = []
+        for action_event, obs_event in action_observation_pairs:
+            if action_event.tool_name != "file_editor":
+                continue
+            # Try to extract the file path from the action
+            file_path = ""
+            if action_event.action:
+                action_dict = action_event.action.model_dump()
+                file_path = action_dict.get("path", "") or action_dict.get("file_path", "")
+            summary = action_event.summary or ""
+            if self._looks_like_test_file(file_path, summary):
+                if summary:
+                    test_file_summaries.append(summary)
+            else:
+                if summary:
+                    source_file_summaries.append(summary)
+
         # Process terminal commands as test experiences
         for action_event, obs_event in action_observation_pairs:
             if action_event.tool_name != "terminal":
@@ -396,17 +415,27 @@ class MemoryManager:
             self.store.save_test_experience(exp)
             test_count += 1
 
+        # Save test file edits as a test experience (separate from terminal runs)
+        if test_file_summaries:
+            test_edit_desc = "; ".join(test_file_summaries[-3:])
+            exp = TestExperience(
+                instance_id=self.instance_id,
+                repo=self.repo,
+                issue_description=self.issue_description,
+                new_test="",  # No command — this is a file edit experience
+                description=f"[test file edits] {test_edit_desc}",
+            )
+            self.store.save_test_experience(exp)
+            test_count += 1
+
         # Save the final git patch as a patch experience
         if git_patch and git_patch.strip():
-            # Collect the agent's final thoughts about the patch
-            patch_descriptions = []
-            for action_event, _ in action_observation_pairs:
-                if action_event.tool_name == "file_editor":
-                    summary = action_event.summary or ""
-                    if summary:
-                        patch_descriptions.append(summary)
-
-            description = "; ".join(patch_descriptions[-3:]) if patch_descriptions else "Agent patch"
+            # Use only source file edit summaries for the description
+            description = (
+                "; ".join(source_file_summaries[-3:])
+                if source_file_summaries
+                else "Agent patch"
+            )
 
             exp = PatchExperience(
                 instance_id=self.instance_id,
@@ -433,4 +462,16 @@ class MemoryManager:
         ]
         command_lower = command.lower()
         return any(indicator in command_lower for indicator in test_indicators)
+
+    @staticmethod
+    def _looks_like_test_file(file_path: str, summary: str = "") -> bool:
+        """Heuristic: does this file path or summary indicate a test file?"""
+        combined = (file_path + " " + summary).lower()
+        test_indicators = [
+            "test_", "_test.py", "/tests/", "conftest",
+            "testing/", "test.py",
+        ]
+        # Check if the text mentions test-related keywords
+        return any(indicator in combined for indicator in test_indicators)
+
 
