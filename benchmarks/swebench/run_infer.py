@@ -34,7 +34,7 @@ from benchmarks.utils.models import (
 from benchmarks.utils.version import SDK_SHORT_SHA
 from openhands.sdk import LLM, Agent, Conversation, get_logger
 from openhands.sdk.workspace import RemoteWorkspace
-from openhands.sdk.tool import Tool, register_tool
+
 from openhands.tools.preset.default import get_default_tools
 from openhands.workspace import APIRemoteWorkspace, DockerWorkspace
 
@@ -234,46 +234,45 @@ class SWEBenchEvaluation(Evaluation):
             enable_browser=False,
         )
 
-        # --- Memory system integration ---
+        # --- Memory system integration (prompt injection) ---
+        # NOTE: Custom tools can't work with Docker workspace because tool
+        # resolution happens server-side inside the container. Instead, we
+        # inject relevant experiences directly into the instruction prompt.
         use_memory = getattr(self, '_use_memory', False)
         memory_manager = None
+        experience_prompt = ""
 
         if use_memory:
-            from benchmarks.swebench.memory_config import MemoryConfig
-            from benchmarks.swebench.experience_hooks import MemoryManager
-            from benchmarks.swebench.label_action_tool import LabelActionTool
-            from benchmarks.swebench.recall_experience_tool import RecallExperienceTool
+            try:
+                from benchmarks.swebench.memory_config import MemoryConfig
+                from benchmarks.swebench.experience_hooks import MemoryManager
 
-            # Initialize memory manager for this instance
-            memory_config = MemoryConfig()
-            memory_manager = MemoryManager(
-                config=memory_config,
-                llm=self.metadata.llm,
-                instance_id=instance.id,
-                repo=instance.data.get('repo', ''),
-                issue_description=instance.data.get('problem_statement', ''),
-            )
+                memory_config = MemoryConfig()
+                memory_manager = MemoryManager(
+                    config=memory_config,
+                    llm=self.metadata.llm,
+                    instance_id=instance.id,
+                    repo=instance.data.get('repo', ''),
+                    issue_description=instance.data.get('problem_statement', ''),
+                )
 
-            # Register tools with callbacks wired to this MemoryManager
-            register_tool(
-                LabelActionTool.name,
-                lambda params, conv_state: LabelActionTool.create(
-                    conv_state=conv_state,
-                    on_label_callback=memory_manager.on_action_labeled,
-                ),
-            )
-            register_tool(
-                RecallExperienceTool.name,
-                lambda params, conv_state: RecallExperienceTool.create(
-                    conv_state=conv_state,
-                    on_recall_callback=memory_manager.on_recall_experience,
-                ),
-            )
+                # Retrieve relevant experiences for both test and patch
+                test_exp = memory_manager.get_test_experience_prompt()
+                patch_exp = memory_manager.get_patch_experience_prompt()
 
-            tools.append(Tool(name=LabelActionTool.name))
-            tools.append(Tool(name=RecallExperienceTool.name))
-            logger.info("Memory system enabled with tools: %s, %s",
-                        LabelActionTool.name, RecallExperienceTool.name)
+                if test_exp or patch_exp:
+                    experience_prompt = "\n\n--- RELEVANT PAST EXPERIENCES ---\n"
+                    if test_exp:
+                        experience_prompt += f"\n{test_exp}\n"
+                    if patch_exp:
+                        experience_prompt += f"\n{patch_exp}\n"
+                    experience_prompt += "--- END PAST EXPERIENCES ---\n"
+                    logger.info("Memory: injected %d test + %d patch experience chars",
+                                len(test_exp), len(patch_exp))
+                else:
+                    logger.info("Memory: no relevant past experiences found")
+            except Exception as e:
+                logger.warning("Memory system failed, continuing without: %s", e)
 
         agent = Agent(
             llm=self.metadata.llm,
@@ -323,6 +322,11 @@ class SWEBenchEvaluation(Evaluation):
             metadata=self.metadata,
             workspace_path=workspace.working_dir,
         )
+
+        # Append experience context to instruction if available
+        if experience_prompt:
+            instruction += experience_prompt
+
         conversation.send_message(instruction)
         # Run conversation with fake user responses to handle agent messages
         run_conversation_with_fake_user_response(conversation)
